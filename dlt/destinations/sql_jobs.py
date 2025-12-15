@@ -181,6 +181,8 @@ class SqlMergeFollowupJob(SqlFollowupJob):
             merge_sql = cls.gen_merge_sql(table_chain, sql_client)
         elif merge_strategy == "upsert":
             merge_sql = cls.gen_upsert_sql(table_chain, sql_client)
+        elif merge_strategy == "insert-only":
+            merge_sql = cls.gen_insert_only_sql(table_chain, sql_client)
         elif merge_strategy == "scd2":
             merge_sql = cls.gen_scd2_sql(table_chain, sql_client)
 
@@ -707,8 +709,18 @@ class SqlMergeFollowupJob(SqlFollowupJob):
 
     @classmethod
     def gen_upsert_sql(
-        cls, table_chain: Sequence[PreparedTableSchema], sql_client: SqlClientBase[Any]
+        cls,
+        table_chain: Sequence[PreparedTableSchema],
+        sql_client: SqlClientBase[Any],
+        skip_update: bool = False,
     ) -> List[str]:
+        """Generates SQL for upsert merge strategy.
+
+        Args:
+            table_chain: Chain of tables to merge
+            sql_client: SQL client for generating SQL
+            skip_update: If True, skips UPDATE operations (insert-only behavior)
+        """
         sql: List[str] = []
         root_table = table_chain[0]
         root_table_name, staging_root_table_name = sql_client.get_qualified_table_names(
@@ -733,21 +745,45 @@ class SqlMergeFollowupJob(SqlFollowupJob):
         # generate merge statement for root table
         on_str = " AND ".join([f"d.{c} = s.{c}" for c in primary_keys])
         root_table_column_names = list(map(escape_column_id, root_table["columns"]))
-        update_str = ", ".join([c + " = " + "s." + c for c in root_table_column_names])
         col_str = ", ".join(["{alias}" + c for c in root_table_column_names])
-        delete_str = (
-            "" if hard_delete_col is None else f"WHEN MATCHED AND s.{deleted_cond} THEN DELETE"
-        )
 
-        sql.append(f"""
-            MERGE INTO {root_table_name} d USING {staging_root_table_name} s
-            ON {on_str}
-            {delete_str}
-            WHEN MATCHED
-                THEN UPDATE SET {update_str}
-            WHEN NOT MATCHED
-                THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
-        """)
+        # For insert-only: filter out deleted records from staging source
+        # For upsert: handle deletes with DELETE clause
+        if skip_update:
+            # insert-only: filter deleted records from staging
+            staging_source = staging_root_table_name
+            if hard_delete_col is not None:
+                # Get the NOT deleted condition
+                _, not_deleted_cond = cls._get_hard_delete_col_and_cond(
+                    root_table,
+                    escape_column_id,
+                    escape_lit,
+                    invert=True,
+                )
+                staging_source = f"(SELECT * FROM {staging_root_table_name} WHERE {not_deleted_cond})"
+
+            sql.append(f"""
+                MERGE INTO {root_table_name} d USING {staging_source} s
+                ON {on_str}
+                WHEN NOT MATCHED
+                    THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+            """)
+        else:
+            # upsert: include UPDATE and DELETE clauses
+            update_str = ", ".join([c + " = " + "s." + c for c in root_table_column_names])
+            delete_str = (
+                "" if hard_delete_col is None else f"WHEN MATCHED AND s.{deleted_cond} THEN DELETE"
+            )
+
+            sql.append(f"""
+                MERGE INTO {root_table_name} d USING {staging_root_table_name} s
+                ON {on_str}
+                {delete_str}
+                WHEN MATCHED
+                    THEN UPDATE SET {update_str}
+                WHEN NOT MATCHED
+                    THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+            """)
 
         # generate statements for nested tables if they exist
         nested_tables = table_chain[1:]
@@ -769,47 +805,69 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                         sql_client.fully_qualified_dataset_name(staging=True),
                     )
                 )
-                root_key_column = escape_column_id(
-                    cls.get_root_key_col(
-                        table_chain,
-                        table,
-                        sql_client.fully_qualified_dataset_name(),
-                        sql_client.fully_qualified_dataset_name(staging=True),
-                    )
-                )
                 table_name, staging_table_name = sql_client.get_qualified_table_names(table["name"])
-
-                # delete records for elements no longer in the list
-                sql.append(f"""
-                    DELETE FROM {table_name}
-                    WHERE {root_key_column} IN (SELECT {root_row_key_column} FROM {staging_root_table_name})
-                    AND {nested_row_key_column} NOT IN (SELECT {nested_row_key_column} FROM {staging_table_name});
-                """)
-
-                # insert records for new elements in the list
                 table_column_names = list(map(escape_column_id, table["columns"]))
-                update_str = ", ".join([c + " = " + "s." + c for c in table_column_names])
                 col_str = ", ".join(["{alias}" + c for c in table_column_names])
-                sql.append(f"""
-                    MERGE INTO {table_name} d USING {staging_table_name} s
-                    ON d.{nested_row_key_column} = s.{nested_row_key_column}
-                    WHEN MATCHED
-                        THEN UPDATE SET {update_str}
-                    WHEN NOT MATCHED
-                        THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
-                """)
 
-                # delete hard-deleted records
-                if hard_delete_col is not None:
+                if skip_update:
+                    # insert-only: only insert new records, no updates or deletes
+                    sql.append(f"""
+                        MERGE INTO {table_name} d USING {staging_table_name} s
+                        ON d.{nested_row_key_column} = s.{nested_row_key_column}
+                        WHEN NOT MATCHED
+                            THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+                    """)
+                else:
+                    # upsert: delete records no longer in list, then upsert
+                    root_key_column = escape_column_id(
+                        cls.get_root_key_col(
+                            table_chain,
+                            table,
+                            sql_client.fully_qualified_dataset_name(),
+                            sql_client.fully_qualified_dataset_name(staging=True),
+                        )
+                    )
+
+                    # delete records for elements no longer in the list
                     sql.append(f"""
                         DELETE FROM {table_name}
-                        WHERE {root_key_column} IN (
-                            SELECT {root_row_key_column}
-                            FROM {staging_root_table_name}
-                            WHERE {deleted_cond}
-                        );
+                        WHERE {root_key_column} IN (SELECT {root_row_key_column} FROM {staging_root_table_name})
+                        AND {nested_row_key_column} NOT IN (SELECT {nested_row_key_column} FROM {staging_table_name});
                     """)
+
+                    # insert/update records
+                    update_str = ", ".join([c + " = " + "s." + c for c in table_column_names])
+                    sql.append(f"""
+                        MERGE INTO {table_name} d USING {staging_table_name} s
+                        ON d.{nested_row_key_column} = s.{nested_row_key_column}
+                        WHEN MATCHED
+                            THEN UPDATE SET {update_str}
+                        WHEN NOT MATCHED
+                            THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+                    """)
+
+                    # delete hard-deleted records
+                    if hard_delete_col is not None:
+                        sql.append(f"""
+                            DELETE FROM {table_name}
+                            WHERE {root_key_column} IN (
+                                SELECT {root_row_key_column}
+                                FROM {staging_root_table_name}
+                                WHERE {deleted_cond}
+                            );
+                        """)
         return sql
+
+    @classmethod
+    def gen_insert_only_sql(
+        cls, table_chain: Sequence[PreparedTableSchema], sql_client: SqlClientBase[Any]
+    ) -> List[str]:
+        """Generates SQL for insert-only merge strategy.
+
+        This strategy inserts new records based on primary_key but does not update existing records.
+        It reuses the upsert implementation with skip_update=True to avoid code duplication.
+        """
+        return cls.gen_upsert_sql(table_chain, sql_client, skip_update=True)
 
     @classmethod
     def gen_scd2_sql(

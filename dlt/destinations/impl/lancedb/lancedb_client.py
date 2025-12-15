@@ -582,7 +582,7 @@ class LanceDBClient(JobClientBase, WithStateSync):
         jobs = super().create_table_chain_completed_followup_jobs(
             table_chain, completed_table_chain_jobs  # type: ignore[arg-type]
         )
-        # Orphan removal is only supported for upsert strategy because we need a deterministic key hash.
+        # Orphan removal is only supported for upsert and insert-only strategies because we need a deterministic key hash.
         first_table_in_chain = table_chain[0]
         if first_table_in_chain.get(
             "write_disposition"

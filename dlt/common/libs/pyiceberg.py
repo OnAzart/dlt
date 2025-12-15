@@ -89,7 +89,7 @@ def merge_iceberg_table(
 ) -> None:
     """Merges in-memory Arrow data into on-disk Iceberg table."""
     strategy = schema["x-merge-strategy"]  # type: ignore[typeddict-item]
-    if strategy == "upsert":
+    if strategy in ("upsert", "insert-only"):
         # evolve schema
         with table.update_schema() as update:
             update.union_by_name(ensure_iceberg_compatible_arrow_schema(data.schema))
@@ -99,6 +99,10 @@ def merge_iceberg_table(
         else:
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
+        # insert-only: skip update, only insert new records
+        # upsert: update existing records and insert new ones
+        when_matched_update = strategy == "upsert"
+
         # TODO: replace the batching method with transaction with pyiceberg's release after 0.9.1
         for rb in data.to_batches(max_chunksize=1_000):
             batch_tbl = pa.Table.from_batches([rb])
@@ -107,7 +111,7 @@ def merge_iceberg_table(
             table.upsert(
                 df=batch_tbl,
                 join_cols=join_cols,
-                when_matched_update_all=True,
+                when_matched_update_all=when_matched_update,
                 when_not_matched_insert_all=True,
                 case_sensitive=True,
             )

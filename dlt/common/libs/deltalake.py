@@ -123,7 +123,7 @@ def merge_delta_table(
     """Merges in-memory Arrow data into on-disk Delta table."""
 
     strategy = schema["x-merge-strategy"]  # type: ignore[typeddict-item]
-    if strategy == "upsert":
+    if strategy in ("upsert", "insert-only"):
         # `DeltaTable.merge` does not support automatic schema evolution
         # https://github.com/delta-io/delta-rs/issues/2282
         # NOTE: fixing the issue didn't help here
@@ -137,17 +137,19 @@ def merge_delta_table(
             predicate = " AND ".join([f"target.{c} = source.{c}" for c in primary_keys])
 
         partition_by = get_columns_names_with_prop(schema, "partition")
-        qry = (
-            table.merge(
-                source=ensure_delta_compatible_arrow_data(data, partition_by),
-                predicate=predicate,
-                source_alias="source",
-                target_alias="target",
-                streamed_exec=streamed_exec,
-            )
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
+        qry = table.merge(
+            source=ensure_delta_compatible_arrow_data(data, partition_by),
+            predicate=predicate,
+            source_alias="source",
+            target_alias="target",
+            streamed_exec=streamed_exec,
         )
+
+        # insert-only: skip update, only insert new records
+        # upsert: update existing records and insert new ones
+        if strategy == "upsert":
+            qry = qry.when_matched_update_all()
+        qry = qry.when_not_matched_insert_all()
 
         qry.execute()
     else:
